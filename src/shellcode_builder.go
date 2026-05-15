@@ -34,86 +34,65 @@ func encodeMovk(rd int, imm16 uint16, shift int) uint32 {
 // It handles PID validation, forks the control flow, loads the library via dlopen,
 // drops the handle in the mailbox, and returns.
 //
-// Stealth features:
-//   - Opens the payload file before unlinking it from disk
-//   - Unlinks the file (disappears from filesystem immediately)
-//   - Calls dlopen (kernel serves from page cache since fd is still open)
-//   - Closes the fd after dlopen completes
+// Stealth sequence (order matters):
+//  1. dlopen the payload (linker opens and maps the file)
+//  2. unlink the file from disk (file disappears, but pages remain mapped)
+//  3. write handle to mailbox
+//  4. return
 //
-// This ensures the payload file is gone before the app's anti-tamper code runs.
+// The file is gone from disk before the app's anti-tamper code runs in onCreate.
 func BuildAgnosticShellcode(zygotePid int, setArgV0Addr uint64, dlopenAddr uint64, mailboxAddr uint64, libPath string, origBackup []byte) []byte {
 	trap := make([]byte, 512)
 
-	// [0x00] PID Check
+	// [0x00] PID Check — skip to parent path if we're zygote
 	binary.LittleEndian.PutUint32(trap[0x00:], 0xd2801588)                               // mov x8, #172 (getpid)
 	binary.LittleEndian.PutUint32(trap[0x04:], 0xd4000001)                               // svc #0
 	binary.LittleEndian.PutUint32(trap[0x08:], 0x52800001|(uint32(zygotePid&0xffff)<<5)) // mov w1, zygotePid[15:0]
 	binary.LittleEndian.PutUint32(trap[0x0c:], 0x6b01001f)                               // cmp w0, w1
-	binary.LittleEndian.PutUint32(trap[0x10:], 0x54000380)                               // b.eq +112 (to 0x80 - Parent)
+	binary.LittleEndian.PutUint32(trap[0x10:], 0x540004a0)                               // b.eq +0x94 → parent at 0xa4
 
-	// [0x14] Child Path — open file, unlink, dlopen via page cache
+	// [0x14] Child Path — dlopen first, then unlink
 	// Save caller state
 	binary.LittleEndian.PutUint32(trap[0x14:], 0xd10103ff) // sub sp, sp, #64
 	binary.LittleEndian.PutUint32(trap[0x18:], 0xa90007e0) // stp x0, x1, [sp, #0]
 	binary.LittleEndian.PutUint32(trap[0x1c:], 0xa9010fe2) // stp x2, x3, [sp, #16]
 	binary.LittleEndian.PutUint32(trap[0x20:], 0xf90013fe) // str x30, [sp, #32]
 
-	// openat(AT_FDCWD, libPath, O_RDONLY, 0) — SYS_openat = 56
-	binary.LittleEndian.PutUint32(trap[0x24:], encodeAdr(0, 0x24, 0x150)) // adr x0, libPath (at 0x150)
-	binary.LittleEndian.PutUint32(trap[0x28:], 0xd2800001)                // mov x1, #0 (O_RDONLY)
-	binary.LittleEndian.PutUint32(trap[0x2c:], 0xd2800002)                // mov x2, #0
-	binary.LittleEndian.PutUint32(trap[0x30:], encodeMov(3, 0))           // mov x3, #0 (mode)
-	binary.LittleEndian.PutUint32(trap[0x34:], 0xd2800002)                // mov x2, #0 (flags = O_RDONLY)
-	binary.LittleEndian.PutUint32(trap[0x38:], 0x92800c60)                // movn x0, #0x63 → x0 = ~0x63 = -100 (AT_FDCWD)
+	// dlopen(libPath, RTLD_NOW)
+	binary.LittleEndian.PutUint32(trap[0x24:], encodeAdr(0, 0x24, 0x150)) // adr x0, libPath
+	binary.LittleEndian.PutUint32(trap[0x28:], 0xd2800041)                // mov x1, #2 (RTLD_NOW)
+	binary.LittleEndian.PutUint32(trap[0x2c:], encodeLdr(8, 0x2c, 0x110)) // ldr x8, dlopenAddr
+	binary.LittleEndian.PutUint32(trap[0x30:], 0xd63f0100)                // blr x8
+	// x0 = dlopen handle (or NULL on failure)
+	binary.LittleEndian.PutUint32(trap[0x34:], 0xaa0003e9) // mov x9, x0 (save handle)
+
+	// unlinkat(AT_FDCWD, libPath, 0) — remove file from disk
+	binary.LittleEndian.PutUint32(trap[0x38:], 0x92800c60)                // movn x0, #0x63 → AT_FDCWD
 	binary.LittleEndian.PutUint32(trap[0x3c:], encodeAdr(1, 0x3c, 0x150)) // adr x1, libPath
-	binary.LittleEndian.PutUint32(trap[0x40:], 0xd2800002)                // mov x2, #0 (O_RDONLY)
-	binary.LittleEndian.PutUint32(trap[0x44:], 0xd2800003)                // mov x3, #0
-	binary.LittleEndian.PutUint32(trap[0x48:], 0xd2800708)                // mov x8, #56 (SYS_openat)
-	binary.LittleEndian.PutUint32(trap[0x4c:], 0xd4000001)                // svc #0
-	// x0 = fd
-	binary.LittleEndian.PutUint32(trap[0x50:], 0xf90017e0) // str x0, [sp, #40] (save fd)
-
-	// unlinkat(AT_FDCWD, libPath, 0) — SYS_unlinkat = 35
-	binary.LittleEndian.PutUint32(trap[0x54:], 0x92800c60)                // movn x0, #0x63 → AT_FDCWD = -100
-	binary.LittleEndian.PutUint32(trap[0x58:], encodeAdr(1, 0x58, 0x150)) // adr x1, libPath
-	binary.LittleEndian.PutUint32(trap[0x5c:], 0xd2800002)                // mov x2, #0 (flags=0)
-	binary.LittleEndian.PutUint32(trap[0x60:], 0xd2800468)                // mov x8, #35 (SYS_unlinkat)
-	binary.LittleEndian.PutUint32(trap[0x64:], 0xd4000001)                // svc #0
-
-	// dlopen(libPath, RTLD_NOW) — file is unlinked but kernel serves from page cache
-	binary.LittleEndian.PutUint32(trap[0x68:], encodeAdr(0, 0x68, 0x150)) // adr x0, libPath
-	binary.LittleEndian.PutUint32(trap[0x6c:], 0xd2800041)                // mov x1, #2 (RTLD_NOW)
-	binary.LittleEndian.PutUint32(trap[0x70:], encodeLdr(8, 0x70, 0x110)) // ldr x8, dlopenAddr
-	binary.LittleEndian.PutUint32(trap[0x74:], 0xd63f0100)                // blr x8
-	// x0 = dlopen handle
-
-	// close(fd) — SYS_close = 57
-	binary.LittleEndian.PutUint32(trap[0x78:], 0xaa0003e9) // mov x9, x0 (save handle)
-	binary.LittleEndian.PutUint32(trap[0x7c:], 0xf94017e0) // ldr x0, [sp, #40] (fd)
-	binary.LittleEndian.PutUint32(trap[0x80:], 0xd2800728) // mov x8, #57 (SYS_close)
-	binary.LittleEndian.PutUint32(trap[0x84:], 0xd4000001) // svc #0
+	binary.LittleEndian.PutUint32(trap[0x40:], 0xd2800002)                // mov x2, #0 (flags=0)
+	binary.LittleEndian.PutUint32(trap[0x44:], 0xd2800468)                // mov x8, #35 (SYS_unlinkat)
+	binary.LittleEndian.PutUint32(trap[0x48:], 0xd4000001)                // svc #0
 
 	// Write handle to mailbox
-	binary.LittleEndian.PutUint32(trap[0x88:], encodeLdr(1, 0x88, 0x120)) // ldr x1, mailboxAddr
-	binary.LittleEndian.PutUint32(trap[0x8c:], 0xf9000029)                // str x9, [x1]
+	binary.LittleEndian.PutUint32(trap[0x4c:], encodeLdr(1, 0x4c, 0x120)) // ldr x1, mailboxAddr
+	binary.LittleEndian.PutUint32(trap[0x50:], 0xf9000029)                // str x9, [x1]
 
 	// Restore and return
-	binary.LittleEndian.PutUint32(trap[0x90:], 0xa94007e0) // ldp x0, x1, [sp, #0]
-	binary.LittleEndian.PutUint32(trap[0x94:], 0xa9410fe2) // ldp x2, x3, [sp, #16]
-	binary.LittleEndian.PutUint32(trap[0x98:], 0xf94013fe) // ldr x30, [sp, #32]
-	binary.LittleEndian.PutUint32(trap[0x9c:], 0x910103ff) // add sp, sp, #64
-	binary.LittleEndian.PutUint32(trap[0xa0:], 0xd65f03c0) // ret
+	binary.LittleEndian.PutUint32(trap[0x54:], 0xa94007e0) // ldp x0, x1, [sp, #0]
+	binary.LittleEndian.PutUint32(trap[0x58:], 0xa9410fe2) // ldp x2, x3, [sp, #16]
+	binary.LittleEndian.PutUint32(trap[0x5c:], 0xf94013fe) // ldr x30, [sp, #32]
+	binary.LittleEndian.PutUint32(trap[0x60:], 0x910103ff) // add sp, sp, #64
+	binary.LittleEndian.PutUint32(trap[0x64:], 0xd65f03c0) // ret
 
-	// [0xc0] Parent Path Code — execute original instructions and jump back
-	copy(trap[0xc0:0xe0], origBackup[:32])
-	binary.LittleEndian.PutUint32(trap[0xe0:], encodeLdr(8, 0xe0, 0x100)) // ldr x8, returnTarget
-	binary.LittleEndian.PutUint32(trap[0xe4:], 0xd61f0100)                // br x8
+	// [0xa4] Parent Path Code
+	copy(trap[0xa4:0xc4], origBackup[:32])
+	binary.LittleEndian.PutUint32(trap[0xc4:], encodeLdr(8, 0xc4, 0x100)) // ldr x8, returnTarget
+	binary.LittleEndian.PutUint32(trap[0xc8:], 0xd61f0100)                // br x8
 
 	// [0x100] Data Slots
-	binary.LittleEndian.PutUint64(trap[0x100:], setArgV0Addr+32) // return target (past our overwrite)
+	binary.LittleEndian.PutUint64(trap[0x100:], setArgV0Addr+32) // return target
 	binary.LittleEndian.PutUint64(trap[0x110:], dlopenAddr)      // dlopen address
 	binary.LittleEndian.PutUint64(trap[0x120:], mailboxAddr)     // mailbox address
-	// [0x130] reserved
 	// [0x150] lib path string (null-terminated)
 	copy(trap[0x150:], libPath)
 
@@ -122,27 +101,19 @@ func BuildAgnosticShellcode(zygotePid int, setArgV0Addr uint64, dlopenAddr uint6
 
 // BuildMemfdShellcode constructs a shellcode variant that uses memfd_create for
 // maximum stealth. The payload is loaded from an anonymous memory-backed fd,
-// leaving NO file path in /proc/self/maps — it shows as /memfd:<name> (deleted).
-//
-// This requires the Go injector to:
-// 1. Create a memfd in the TARGET process (via shellcode stub)
-// 2. Write the .so contents into it via /proc/pid/mem
-// 3. Pass the fd number to the dlopen shellcode
-//
-// The unlink-based approach (BuildAgnosticShellcode) is the default.
-// This variant is for environments where even "(deleted)" in maps is checked.
+// leaving NO file path in /proc/self/maps.
 func BuildMemfdShellcode(zygotePid int, setArgV0Addr uint64, dlopenAddr uint64, mailboxAddr uint64, memfd int, origBackup []byte) []byte {
 	trap := make([]byte, 512)
 
 	// Build /proc/self/fd/<N> string
 	fdPath := fmt.Sprintf("/proc/self/fd/%d", memfd)
 
-	// [0x00] PID Check (same as agnostic)
+	// [0x00] PID Check
 	binary.LittleEndian.PutUint32(trap[0x00:], 0xd2801588)                               // mov x8, #172 (getpid)
 	binary.LittleEndian.PutUint32(trap[0x04:], 0xd4000001)                               // svc #0
 	binary.LittleEndian.PutUint32(trap[0x08:], 0x52800001|(uint32(zygotePid&0xffff)<<5)) // mov w1, zygotePid[15:0]
 	binary.LittleEndian.PutUint32(trap[0x0c:], 0x6b01001f)                               // cmp w0, w1
-	binary.LittleEndian.PutUint32(trap[0x10:], 0x54000280)                               // b.eq to parent path
+	binary.LittleEndian.PutUint32(trap[0x10:], 0x54000280)                               // b.eq +0x50 → parent at 0x60
 
 	// [0x14] Child Path — dlopen("/proc/self/fd/N", RTLD_NOW)
 	binary.LittleEndian.PutUint32(trap[0x14:], 0xd10103ff)                // sub sp, sp, #64

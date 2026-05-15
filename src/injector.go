@@ -10,21 +10,18 @@ import (
 )
 
 // DefaultAPILevel is the assumed Android API level when not specified.
-// Android 13 (API 33) is a reasonable default for modern devices.
 const DefaultAPILevel = 33
 
 func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity string) (int, error) {
 	LogInfo("starting spawn injector", "package", pkgName, "mode", "in-place")
 
 	libAndroidPath := "/system/lib64/libandroid_runtime.so"
-	// _Z27android_os_Process_setArgV0P7_JNIEnvP8_jobjectP8_jstring
 	setArgV0Addr, err := FindSymbolAddress(zygotePid, libAndroidPath, "libandroid_runtime.so", "_Z27android_os_Process_setArgV0P7_JNIEnvP8_jobjectP8_jstring")
 	if err != nil {
 		return 0, err
 	}
 	LogDebug("resolved trap symbol", "symbol", "setArgV0", "addr", setArgV0Addr)
 
-	// 1. Mailbox Setup (Agnostic Handshake)
 	rwBase, err := GetModuleRWSegment(zygotePid, "libandroid_runtime.so")
 	if err != nil {
 		return 0, fmt.Errorf("failed to find RW segment: %v", err)
@@ -38,7 +35,7 @@ func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity str
 	dlopenAddr := linkerBase + dlopenOffset
 	LogDebug("resolved loader symbol", "symbol", "dlopen", "addr", dlopenAddr)
 
-	// 2. Build Shellcode Payload
+	// Build shellcode — uses __loader_dlopen which works from any permitted path
 	trap := BuildAgnosticShellcode(zygotePid, setArgV0Addr, dlopenAddr, mailboxAddr, libPath, origBackup)
 
 	LogInfo("recording zygote children")
@@ -73,7 +70,7 @@ func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity str
 		if childPid != 0 {
 			break
 		}
-		time.Sleep(10 * time.Millisecond) // Tighter polling for less timing exposure
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	if childPid == 0 {
@@ -81,7 +78,6 @@ func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity str
 	}
 	LogInfo("identified child", "pid", childPid)
 
-	// Resolve mailbox in child
 	zygoteBase, _ := GetModuleBase(zygotePid, "libandroid_runtime.so")
 	childBase, _ := GetModuleBase(childPid, "libandroid_runtime.so")
 	childMailboxAddr := childBase + (mailboxAddr - zygoteBase)
@@ -94,40 +90,30 @@ func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity str
 			handle := binary.LittleEndian.Uint64(val)
 			if handle != 0 {
 				LogInfo("handshake successful", "handle", handle, "type", "agnostic")
-
-				// Post-injection stealth: run all hiding phases
 				runPostInjectionStealth(childPid, libPath, setArgV0Addr)
-
 				return childPid, nil
 			}
 		}
-		time.Sleep(5 * time.Millisecond) // Tighter polling
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	return childPid, fmt.Errorf("agnostic handshake timeout")
 }
 
-// runPostInjectionStealth executes all post-dlopen stealth measures.
-// These are best-effort — failures are logged as warnings but don't fail injection.
 func runPostInjectionStealth(childPid int, libPath string, trapAddr uint64) {
 	LogInfo("running post-injection stealth sequence")
-
-	// Small delay to let dlopen fully complete (relocations, constructors)
 	time.Sleep(50 * time.Millisecond)
 
-	// Phase 1: Unlink from soinfo list (hides from dl_iterate_phdr)
 	LogDebug("phase 1: soinfo unlinking")
 	if err := UnlinkSoinfo(childPid, libPath, DefaultAPILevel); err != nil {
 		LogWarn("soinfo unlink failed (non-fatal)", "error", err)
 	}
 
-	// Phase 2: Anonymize memory mappings (hides from /proc/self/maps)
 	LogDebug("phase 2: anonymous remap")
 	if err := AnonymizePayloadMappings(childPid, libPath, trapAddr); err != nil {
 		LogWarn("anonymous remap failed (non-fatal)", "error", err)
 	}
 
-	// Phase 3: Scrub linker artifacts (removes path strings from memory)
 	LogDebug("phase 3: linker scrub")
 	if err := ScrubLinkerArtifacts(childPid, libPath); err != nil {
 		LogWarn("linker scrub failed (non-fatal)", "error", err)
