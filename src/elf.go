@@ -1,11 +1,47 @@
 package main
 
 import (
+	"bytes"
 	"debug/elf"
 	"fmt"
 	"os"
 	"strings"
 )
+
+// GetElfMappingSpan computes total memory span (first LOAD start to last LOAD end)
+// for an ELF shared library. Returns page-aligned (start_vaddr, end_vaddr).
+func GetElfMappingSpan(libPath string) (uint64, uint64, error) {
+	raw, err := os.ReadFile(libPath)
+	if err != nil {
+		return 0, 0, err
+	}
+	f, err := elf.NewFile(bytes.NewReader(raw))
+	if err != nil {
+		return 0, 0, err
+	}
+	defer f.Close()
+
+	var minStart, maxEnd uint64 = ^uint64(0), 0
+	for _, prog := range f.Progs {
+		if prog.Type != elf.PT_LOAD {
+			continue
+		}
+		start := prog.Vaddr
+		end := prog.Vaddr + prog.Memsz
+		if start < minStart {
+			minStart = start
+		}
+		if end > maxEnd {
+			maxEnd = end
+		}
+	}
+	if minStart == ^uint64(0) {
+		return 0, 0, fmt.Errorf("no PT_LOAD in %s", libPath)
+	}
+	minStart &^= 0xfff
+	maxEnd = (maxEnd + 0xfff) &^ 0xfff
+	return minStart, maxEnd, nil
+}
 
 func FindSymbolOffset(libPath string, symbolName string) (uint64, error) {
 	f, err := os.Open(libPath)

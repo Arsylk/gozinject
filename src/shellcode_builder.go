@@ -34,13 +34,8 @@ func encodeMovk(rd int, imm16 uint16, shift int) uint32 {
 // It handles PID validation, forks the control flow, loads the library via dlopen,
 // drops the handle in the mailbox, and returns.
 //
-// Stealth sequence (order matters):
-//  1. dlopen the payload (linker opens and maps the file)
-//  2. unlink the file from disk (file disappears, but pages remain mapped)
-//  3. write handle to mailbox
-//  4. return
-//
-// The file is gone from disk before the app's anti-tamper code runs in onCreate.
+// Post-injection steps (soinfo unlink + vma_hide) are handled by the injector
+// from userspace (via UnlinkSoinfo → hideVma), not from shellcode.
 func BuildAgnosticShellcode(zygotePid int, setArgV0Addr uint64, dlopenAddr uint64, mailboxAddr uint64, libPath string, origBackup []byte) []byte {
 	trap := make([]byte, 512)
 
@@ -66,7 +61,7 @@ func BuildAgnosticShellcode(zygotePid int, setArgV0Addr uint64, dlopenAddr uint6
 	// x0 = dlopen handle (or NULL on failure)
 	binary.LittleEndian.PutUint32(trap[0x34:], 0xaa0003e9) // mov x9, x0 (save handle)
 
-	// [0x38-0x4b] NOP'd — unlinkat removed
+	// [0x38-0x4b] NOP'd — unlinkat and vma_hide handled by injector post-handshake
 	binary.LittleEndian.PutUint32(trap[0x38:], 0xd503201f) // nop
 	binary.LittleEndian.PutUint32(trap[0x3c:], 0xd503201f) // nop
 	binary.LittleEndian.PutUint32(trap[0x40:], 0xd503201f) // nop

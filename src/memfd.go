@@ -366,12 +366,11 @@ func RunMemfdInjector(pkgName string, payloadPath string, zygotePid int, mainAct
 			// Best-effort soinfo unlinking for memfd paths.
 			time.Sleep(50 * time.Millisecond)
 			fdPath := fmt.Sprintf("/proc/self/fd/%d", memfd)
-			if err := UnlinkSoinfo(childPid, fdPath, DefaultAPILevel); err != nil {
+			if _, err := UnlinkSoinfo(childPid, fdPath, DefaultAPILevel); err != nil {
 				LogWarn("soinfo unlink failed (non-fatal)", "error", err)
 			}
-			if err := UnlinkSoinfo(childPid, "memfd:jit-cache", DefaultAPILevel); err != nil {
-				_ = err // don't warn on second unlink
-			}
+			// Second unlink for name-based match (memfd path in maps)
+			_, _ = UnlinkSoinfo(childPid, "memfd:jit-cache", DefaultAPILevel)
 
 			return childPid, nil
 		}

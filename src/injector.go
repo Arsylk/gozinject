@@ -106,11 +106,12 @@ func RunInjector(pkgName string, libPath string, zygotePid int, mainActivity str
 			if handle != 0 {
 				LogInfo("handshake successful", "handle", handle, "type", "agnostic")
 
-				// Best-effort soinfo unlinking: removes the payload from the
-				// linker's soinfo linked list so dl_iterate_phdr() skips it.
+				// Best-effort soinfo unlinking + vma_hide
 				time.Sleep(50 * time.Millisecond)
-				if err := UnlinkSoinfo(childPid, libPath, DefaultAPILevel); err != nil {
+				if vma, err := UnlinkSoinfo(childPid, libPath, DefaultAPILevel); err != nil {
 					LogWarn("soinfo unlink failed (non-fatal)", "error", err)
+				} else {
+					_ = vma
 				}
 
 				return childPid, nil
